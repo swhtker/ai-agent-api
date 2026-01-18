@@ -6,8 +6,8 @@ services:
       context: ./ai-agent-api
       dockerfile: Dockerfile
     container_name: ai-agent-api
-    ports:
-      - "${PORT:-8000}:8000"
+  ports:
+      - "${PORT:-8001}:8000"
     environment:
       - APP_NAME=${APP_NAME:-AI Agent API}
       - DEBUG=${DEBUG:-false}
