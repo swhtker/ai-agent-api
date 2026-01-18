@@ -7,7 +7,7 @@ services:
       dockerfile: Dockerfile
     container_name: ai-agent-api
   ports:
-      - "${PORT:-8001}:8000"
+      - "${PORT:-8001}:8081"
     environment:
       - APP_NAME=${APP_NAME:-AI Agent API}
       - DEBUG=${DEBUG:-false}
@@ -18,7 +18,7 @@ services:
       - agent-data:/app/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health')"]
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8081/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
