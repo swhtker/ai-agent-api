@@ -1,103 +1,196 @@
 from datetime import datetime
-from typing import List
-import logging
+from typing import Optional, Dict, Any
 
-from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel
+from fastapi import FastAPI, Depends, HTTPException, Security, status
+from fastapi.security import APIKeyHeader
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.database import get_db
-from app import models
+from .config import get_settings
+from .database import get_db, init_db
+from . import models
+from .routers import training, chat  # include chat router
 
-logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/chat", tags=["chat"])
+settings = get_settings()
+
+# Initialize FastAPI
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    debug=settings.DEBUG,
+)
+
+# CORS
+origins = settings.CORS_ORIGINS.split(",")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include routers
+# Training router for WordPress AI Training Chat
+app.include_router(training.router, prefix="/api")
+# Chat router for interactive chat
+app.include_router(chat.router, prefix="/api")
+
+# API Key Security
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
-class ChatMessage(BaseModel):
-    role: str
-    content: str
+async def verify_api_key(api_key: str = Security(api_key_header)):
+    """Simple API key verification"""
+    if api_key != settings.API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing API Key",
+        )
+    return api_key
 
 
-class ChatRequest(BaseModel):
-    messages: List[ChatMessage]
+# Pydantic schemas
+class TaskCreate(BaseModel):
+    title: str = Field(..., max_length=255)
+    description: Optional[str] = None
+    task_type: Optional[str] = None
+    input_data: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 
-class ChatResponse(BaseModel):
-    id: str
-    role: str
-    content: str
-    timestamp: str
+class TaskUpdate(BaseModel):
+    title: Optional[str] = Field(None, max_length=255)
+    description: Optional[str] = None
+    status: Optional[str] = None
+    output_data: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 
-@router.post("", response_model=ChatResponse)
-async def chat(
-    request: ChatRequest,
+# Startup event
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database on startup"""
+    init_db()
+    print(f"✅ {settings.APP_NAME} v{settings.APP_VERSION} started")
+
+
+# Routes
+@app.get("/")
+async def root():
+    return {
+        "name": settings.APP_NAME,
+        "version": settings.APP_VERSION,
+        "status": "running",
+    }
+
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "database": "sqlite",
+    }
+
+
+@app.post("/tasks", status_code=status.HTTP_201_CREATED)
+async def create_task(
+    task: TaskCreate,
     db: Session = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
 ):
-    """
-    Simple ChatGPT-like chat endpoint:
-    - takes a list of messages [{role, content}]
-    - calls your model
-    - returns assistant reply
-    """
-    try:
-        # Get last user message
-        user_message = next(
-            (m for m in reversed(request.messages) if m.role == "user"),
-            None,
-        )
-        if not user_message:
-            raise HTTPException(status_code=400, detail="No user message provided")
+    """Create a new task"""
+    db_task = models.Task(**task.model_dump())
+    db.add(db_task)
+    db.commit()
+    db.refresh(db_task)
+    return db_task.to_dict()
 
-        # TODO: replace this with your real model call
-        # e.g. call OpenAI, Claude, local model, or your worker pipeline
-        assistant_text = (
-            "This is a placeholder answer. "
-            "Wire this function to your real AI worker or model."
-        )
 
-        reply_id = f"chat_{int(datetime.utcnow().timestamp() * 1000)}"
-        timestamp = datetime.utcnow().isoformat()
+@app.get("/tasks/{task_id}")
+async def get_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    """Get a specific task by ID"""
+    task = db.query(models.Task).filter(models.Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task.to_dict()
 
-        # Optionally store chat in Task table
-        user_task = models.Task(
-            name=f"Chat user: {user_message.content[:50]}",
-            description=user_message.content,
-            task_type="chat",
-            status="completed",
-            metainfo={
-                "role": "user",
-                "timestamp": timestamp,
-                "message_id": reply_id + "_user",
-            },
-        )
 
-        assistant_task = models.Task(
-            name=f"Chat reply to: {reply_id}",
-            description=assistant_text,
-            task_type="chat",
-            status="completed",
-            metainfo={
-                "role": "assistant",
-                "timestamp": timestamp,
-                "message_id": reply_id,
-            },
-        )
+@app.get("/tasks")
+async def list_tasks(
+    status: Optional[str] = None,
+    task_type: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    """List tasks with optional filtering"""
+    query = db.query(models.Task)
 
-        db.add(user_task)
-        db.add(assistant_task)
-        db.commit()
+    if status:
+        query = query.filter(models.Task.status == status)
+    if task_type:
+        query = query.filter(models.Task.task_type == task_type)
 
-        return ChatResponse(
-            id=reply_id,
-            role="assistant",
-            content=assistant_text,
-            timestamp=timestamp,
-        )
+    tasks = (
+        query.order_by(models.Task.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error in chat endpoint: {e}")
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Chat failed: {str(e)}")
+    return {
+        "tasks": [task.to_dict() for task in tasks],
+        "count": len(tasks),
+        "offset": offset,
+        "limit": limit,
+    }
+
+
+@app.patch("/tasks/{task_id}")
+async def update_task(
+    task_id: int,
+    task_update: TaskUpdate,
+    db: Session = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    """Update a task"""
+    task = db.query(models.Task).filter(models.Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    update_data = task_update.model_dump(exclude_unset=True)
+
+    # Auto-set completed_at when status changes to completed
+    if update_data.get("status") == "completed" and task.status != "completed":
+        update_data["completed_at"] = datetime.utcnow()
+
+    for key, value in update_data.items():
+        setattr(task, key, value)
+
+    db.commit()
+    db.refresh(task)
+    return task.to_dict()
+
+
+@app.delete("/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    """Delete a task"""
+    task = db.query(models.Task).filter(models.Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    db.delete(task)
+    db.commit()
+    return None
