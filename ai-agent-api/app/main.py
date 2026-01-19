@@ -9,6 +9,7 @@ from datetime import datetime
 from .config import get_settings
 from .database import get_db, init_db
 from . import models
+from .routers import training
 
 settings = get_settings()
 
@@ -28,6 +29,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Include training router for WordPress AI Training Chat
+app.include_router(training.router, prefix="/api")
 
 # API Key Security
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
