@@ -64,4 +64,40 @@ async def chat(
             name=f"Chat user: {user_message.content[:50]}",
             description=user_message.content,
             task_type="chat",
-            status="compl
+            status="completed",
+            metainfo={
+                "role": "user",
+                "timestamp": timestamp,
+                "message_id": reply_id + "_user",
+            },
+        )
+
+        assistant_task = models.Task(
+            name=f"Chat reply to: {reply_id}",
+            description=assistant_text,
+            task_type="chat",
+            status="completed",
+            metainfo={
+                "role": "assistant",
+                "timestamp": timestamp,
+                "message_id": reply_id,
+            },
+        )
+
+        db.add(user_task)
+        db.add(assistant_task)
+        db.commit()
+
+        return ChatResponse(
+            id=reply_id,
+            role="assistant",
+            content=assistant_text,
+            timestamp=timestamp,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in chat endpoint: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Chat failed: {str(e)}")
