@@ -22,7 +22,12 @@ app = FastAPI(
 )
 
 # CORS
-origins = settings.CORS_ORIGINS.split(",")
+raw_origins = settings.CORS_ORIGINS or "https://jspriggins.com"
+
+if raw_origins == "*":
+    origins = ["*"]
+else:
+    origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
