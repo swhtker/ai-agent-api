@@ -1,138 +1,108 @@
-from datetime import datetime
-from typing import List
-import logging
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional
 import httpx
 import os
+import logging
 
-from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel
-from sqlalchemy.orm import Session
-
-from app.database import get_db
-from app import models
-
+# Set up logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/chat", tags=["chat"])
 
-# RouteLLM router configuration
-ROUTER_URL = os.getenv("ROUTER_URL", "http://routellm-router:4000")
-ROUTER_MODEL = "router-mf-0.11593"  # RouteLLM model with threshold
+router = APIRouter()
 
+# RouteLLM Router endpoint
+ROUTER_URL = os.getenv("ROUTER_URL", "http://routellm-router:8000/v1/chat/completions")
+ROUTER_MODEL = os.getenv("ROUTER_MODEL", "router-mf-0.11593")
 
-class ChatMessage(BaseModel):
+class Message(BaseModel):
     role: str
     content: str
-
 
 class ChatRequest(BaseModel):
-    messages: List[ChatMessage]
-
+    messages: List[Message]
+    session_id: Optional[str] = None
 
 class ChatResponse(BaseModel):
-    id: str
-    role: str
-    content: str
-    timestamp: str
+    response: str
+    model_used: Optional[str] = None
 
-
-async def call_router(messages: List[dict]) -> str:
-    """
-    Call RouteLLM router which automatically routes between:
-    - Strong model: Claude 3.5 Sonnet (complex queries)
-    - Weak model: Groq Llama 3.1 8B (simple queries)
-
-    The MF (Matrix Factorization) classifier decides which model to use.
-    """
+async def call_router(messages: List[dict]) -> dict:
+    """Call the RouteLLM router to get a response."""
     async with httpx.AsyncClient(timeout=120.0) as client:
         try:
+            logger.info(f"Calling router at {ROUTER_URL}")
+            logger.info(f"Using model: {ROUTER_MODEL}")
+            logger.info(f"Messages count: {len(messages)}")
+
             response = await client.post(
-                f"{ROUTER_URL}/v1/chat/completions",
+                ROUTER_URL,
                 json={
                     "model": ROUTER_MODEL,
                     "messages": messages,
                     "temperature": 0.7,
+                    "drop_params": True,
                 },
-                headers={"Content-Type": "application/json"}
+                headers={"Content-Type": "application/json"},
             )
-            response.raise_for_status()
-            data = response.json()
-            return data["choices"][0]["message"]["content"]
-        except httpx.HTTPStatusError as e:
-            logger.error(f"Router HTTP error: {e.response.status_code} - {e.response.text}")
-            raise HTTPException(status_code=502, detail=f"Router error: {e.response.text}")
+
+            logger.info(f"Router response status: {response.status_code}")
+
+            if response.status_code != 200:
+                logger.error(f"Router error response: {response.text}")
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Router error: {response.text}"
+                )
+
+            result = response.json()
+            logger.info(f"Router response model: {result.get('model', 'unknown')}")
+            return result
+
+        except httpx.TimeoutException:
+            logger.error("Router request timed out")
+            raise HTTPException(status_code=504, detail="Router request timed out")
         except httpx.RequestError as e:
-            logger.error(f"Router connection error: {str(e)}")
-            raise HTTPException(status_code=503, detail="Could not connect to AI router")
-        except Exception as e:
-            logger.error(f"Unexpected error calling router: {str(e)}")
-            raise HTTPException(status_code=500, detail="Internal server error")
+            logger.error(f"Router request failed: {str(e)}")
+            raise HTTPException(status_code=503, detail=f"Router unavailable: {str(e)}")
 
-
-@router.post("", response_model=ChatResponse)
-async def chat(
-    request: ChatRequest,
-    db: Session = Depends(get_db),
-):
+@router.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
     """
-    Simple ChatGPT-like chat endpoint:
-    - takes a list of messages [{role, content}]
-    - calls RouteLLM router (auto-routes to Claude or Groq)
-    - returns assistant reply
+    Chat endpoint that routes requests through RouteLLM.
+    The router will automatically select the best model based on query complexity.
     """
     try:
-        # Get last user message
-        user_message = next(
-            (m for m in reversed(request.messages) if m.role == "user"),
-            None,
-        )
+        # Convert messages to dict format
+        messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
 
-        if not user_message:
-            raise HTTPException(status_code=400, detail="No user message provided")
+        logger.info(f"Processing chat request with {len(messages)} messages")
 
-        # Convert to dict format for API call
-        messages_dict = [{"role": m.role, "content": m.content} for m in request.messages]
+        # Call the router
+        result = await call_router(messages)
 
-        # Call RouteLLM router - it automatically decides Claude vs Groq
-        assistant_text = await call_router(messages_dict)
+        # Extract the response
+        if "choices" in result and len(result["choices"]) > 0:
+            response_content = result["choices"][0]["message"]["content"]
+            model_used = result.get("model", "unknown")
 
-        reply_id = f"chat_{int(datetime.utcnow().timestamp() * 1000)}"
-        timestamp = datetime.utcnow().isoformat()
+            logger.info(f"Chat response generated using model: {model_used}")
 
-        # Optionally store chat in Task table
-        user_task = models.Task(
-            name=f"Chat user: {user_message.content[:50]}",
-            description=user_message.content,
-            task_type="chat",
-            status="completed",
-            metainfo={
-                "role": "user",
-                "timestamp": timestamp,
-                "message_id": reply_id + "_user",
-            },
-        )
-        assistant_task = models.Task(
-            name=f"Chat reply to: {reply_id}",
-            description=assistant_text,
-            task_type="chat",
-            status="completed",
-            metainfo={
-                "role": "assistant",
-                "timestamp": timestamp,
-                "message_id": reply_id + "_assistant",
-            },
-        )
-        db.add(user_task)
-        db.add(assistant_task)
-        db.commit()
+            return ChatResponse(
+                response=response_content,
+                model_used=model_used
+            )
+        else:
+            logger.error(f"Unexpected response format: {result}")
+            raise HTTPException(status_code=500, detail="Unexpected response format from router")
 
-        return ChatResponse(
-            id=reply_id,
-            role="assistant",
-            content=assistant_text,
-            timestamp=timestamp,
-        )
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Chat endpoint error: {str(e)}")
+        logger.error(f"Chat error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {"status": "healthy", "router_url": ROUTER_URL, "router_model": ROUTER_MODEL}
