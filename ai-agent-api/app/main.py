@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional, Dict, Any
 
@@ -8,17 +9,38 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from .config import get_settings
-from .database import get_db, init_db
+from .database import get_db, init_db, engine
 from . import models
-from .routers import training, chat  # include chat router
+from .routers import training, chat
+from .telemetry import telemetry, add_span_attributes, record_exception
 
 settings = get_settings()
 
-# Initialize FastAPI
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan - initialize and shutdown resources."""
+    # Startup
+    init_db()
+    
+    # Initialize telemetry
+    telemetry.initialize()
+    telemetry.instrument_fastapi(app)
+    telemetry.instrument_httpx()
+    telemetry.instrument_sqlalchemy(engine)
+    
+    yield
+    
+    # Shutdown
+    await telemetry.shutdown()
+
+
+# Initialize FastAPI with lifespan
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
     debug=settings.DEBUG,
+    lifespan=lifespan,
 )
 
 # CORS
@@ -28,6 +50,7 @@ if raw_origins == "*":
     origins = ["*"]
 else:
     origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
+    
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -37,53 +60,65 @@ app.add_middleware(
 )
 
 # Include routers
-# Training router for WordPress AI Training Chat
-app.include_router(training.router, prefix="/api")
-# Chat router for interactive chat
-app.include_router(chat.router, prefix="/api")
+app.include_router(training.router, prefix="/api/training", tags=["training"])
+app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
 
 # API Key Security
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
-async def verify_api_key(api_key: str = Security(api_key_header)):
-    """Simple API key verification"""
+async def get_api_key(api_key: str = Security(api_key_header)):
+    if not settings.API_KEY:
+        return None
     if api_key != settings.API_KEY:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing API Key",
+            detail="Invalid API Key",
         )
     return api_key
 
 
-# Pydantic schemas
+# Request/Response Models
+class HealthResponse(BaseModel):
+    status: str
+    timestamp: datetime
+    version: str
+
+
 class TaskCreate(BaseModel):
-    title: str = Field(..., max_length=255)
-    description: Optional[str] = None
-    task_type: Optional[str] = None
-    input_data: Optional[Dict[str, Any]] = None
-    metadata: Optional[Dict[str, Any]] = None
+    name: str = Field(..., description="Task name")
+    description: Optional[str] = Field(None, description="Task description")
+    task_type: str = Field("general", description="Type of task")
+    parameters: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
 
-class TaskUpdate(BaseModel):
-    title: Optional[str] = Field(None, max_length=255)
-    description: Optional[str] = None
-    status: Optional[str] = None
-    output_data: Optional[Dict[str, Any]] = None
-    metadata: Optional[Dict[str, Any]] = None
+class TaskResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str]
+    task_type: str
+    status: str
+    created_at: datetime
+    updated_at: Optional[datetime]
+    
+    class Config:
+        from_attributes = True
 
 
-# Startup event
-@app.on_event("startup")
-async def startup_event():
-    """Initialize database on startup"""
-    init_db()
-    print(f"✅ {settings.APP_NAME} v{settings.APP_VERSION} started")
+# Endpoints
+@app.get("/health", response_model=HealthResponse, tags=["health"])
+async def health_check():
+    """Health check endpoint for monitoring."""
+    return HealthResponse(
+        status="healthy",
+        timestamp=datetime.utcnow(),
+        version=settings.APP_VERSION,
+    )
 
 
-# Routes
-@app.get("/")
+@app.get("/", tags=["root"])
 async def root():
+    """Root endpoint."""
     return {
         "name": settings.APP_NAME,
         "version": settings.APP_VERSION,
@@ -91,111 +126,77 @@ async def root():
     }
 
 
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
-        "database": "sqlite",
-    }
+@app.get("/api/tasks", response_model=list[TaskResponse], tags=["tasks"])
+async def list_tasks(
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    api_key: str = Depends(get_api_key),
+):
+    """List all tasks."""
+    add_span_attributes({"task.operation": "list", "task.skip": skip, "task.limit": limit})
+    tasks = db.query(models.Task).offset(skip).limit(limit).all()
+    return tasks
 
 
-@app.post("/tasks", status_code=status.HTTP_201_CREATED)
+@app.post("/api/tasks", response_model=TaskResponse, status_code=status.HTTP_201_CREATED, tags=["tasks"])
 async def create_task(
     task: TaskCreate,
     db: Session = Depends(get_db),
-    api_key: str = Depends(verify_api_key),
+    api_key: str = Depends(get_api_key),
 ):
-    """Create a new task"""
-    db_task = models.Task(**task.model_dump())
-    db.add(db_task)
-    db.commit()
-    db.refresh(db_task)
-    return db_task.to_dict()
+    """Create a new task."""
+    add_span_attributes({
+        "task.operation": "create",
+        "task.name": task.name,
+        "task.type": task.task_type,
+    })
+    
+    try:
+        db_task = models.Task(
+            name=task.name,
+            description=task.description,
+            task_type=task.task_type,
+            parameters=task.parameters,
+            status="pending",
+        )
+        db.add(db_task)
+        db.commit()
+        db.refresh(db_task)
+        return db_task
+    except Exception as e:
+        record_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/tasks/{task_id}")
+@app.get("/api/tasks/{task_id}", response_model=TaskResponse, tags=["tasks"])
 async def get_task(
     task_id: int,
     db: Session = Depends(get_db),
-    api_key: str = Depends(verify_api_key),
+    api_key: str = Depends(get_api_key),
 ):
-    """Get a specific task by ID"""
+    """Get a specific task by ID."""
+    add_span_attributes({"task.operation": "get", "task.id": task_id})
+    
     task = db.query(models.Task).filter(models.Task.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    return task.to_dict()
+    return task
 
 
-@app.get("/tasks")
-async def list_tasks(
-    status: Optional[str] = None,
-    task_type: Optional[str] = None,
-    limit: int = 50,
-    offset: int = 0,
-    db: Session = Depends(get_db),
-    api_key: str = Depends(verify_api_key),
-):
-    """List tasks with optional filtering"""
-    query = db.query(models.Task)
-
-    if status:
-        query = query.filter(models.Task.status == status)
-    if task_type:
-        query = query.filter(models.Task.task_type == task_type)
-
-    tasks = (
-        query.order_by(models.Task.created_at.desc())
-        .offset(offset)
-        .limit(limit)
-        .all()
-    )
-
-    return {
-        "tasks": [task.to_dict() for task in tasks],
-        "count": len(tasks),
-        "offset": offset,
-        "limit": limit,
-    }
-
-
-@app.patch("/tasks/{task_id}")
-async def update_task(
-    task_id: int,
-    task_update: TaskUpdate,
-    db: Session = Depends(get_db),
-    api_key: str = Depends(verify_api_key),
-):
-    """Update a task"""
-    task = db.query(models.Task).filter(models.Task.id == task_id).first()
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    update_data = task_update.model_dump(exclude_unset=True)
-
-    # Auto-set completed_at when status changes to completed
-    if update_data.get("status") == "completed" and task.status != "completed":
-        update_data["completed_at"] = datetime.utcnow()
-
-    for key, value in update_data.items():
-        setattr(task, key, value)
-
-    db.commit()
-    db.refresh(task)
-    return task.to_dict()
-
-
-@app.delete("/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
+@app.delete("/api/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["tasks"])
 async def delete_task(
     task_id: int,
     db: Session = Depends(get_db),
-    api_key: str = Depends(verify_api_key),
+    api_key: str = Depends(get_api_key),
 ):
-    """Delete a task"""
+    """Delete a task."""
+    add_span_attributes({"task.operation": "delete", "task.id": task_id})
+    
     task = db.query(models.Task).filter(models.Task.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-
+    
     db.delete(task)
     db.commit()
     return None
