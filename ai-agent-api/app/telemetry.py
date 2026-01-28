@@ -5,6 +5,7 @@ Sends traces, metrics, and logs to the Helsinki monitoring stack.
 
 import logging
 import os
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from opentelemetry import trace, metrics
@@ -24,14 +25,12 @@ from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
 from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
 
 
-# Configuration from environment
+# Configuration - Update these for your environment
 OTEL_ENDPOINT = os.getenv("OTEL_ENDPOINT", "89.167.6.124:4317")
 OTEL_ENABLED = os.getenv("OTEL_ENABLED", "true").lower() == "true"
 SERVICE_NAME_VALUE = os.getenv("SERVICE_NAME", "punky-api")
 SERVICE_VERSION_VALUE = os.getenv("SERVICE_VERSION", "1.0.0")
 ENVIRONMENT = os.getenv("ENVIRONMENT", "production")
-
-logger = logging.getLogger(__name__)
 
 
 def create_resource() -> Resource:
@@ -50,7 +49,7 @@ def setup_tracing(resource: Resource) -> TracerProvider:
     
     exporter = OTLPSpanExporter(
         endpoint=OTEL_ENDPOINT,
-        insecure=True,
+        insecure=True,  # Set to False if using TLS
     )
     
     processor = BatchSpanProcessor(exporter)
@@ -69,7 +68,7 @@ def setup_metrics(resource: Resource) -> MeterProvider:
     
     reader = PeriodicExportingMetricReader(
         exporter,
-        export_interval_millis=30000,
+        export_interval_millis=30000,  # Export every 30 seconds
     )
     
     provider = MeterProvider(
@@ -95,6 +94,7 @@ def setup_logging(resource: Resource) -> LoggerProvider:
     
     set_logger_provider(provider)
     
+    # Add OTLP handler to root logger
     handler = LoggingHandler(
         level=logging.INFO,
         logger_provider=provider,
@@ -116,9 +116,12 @@ class TelemetryManager:
     
     def initialize(self):
         """Initialize all telemetry components."""
-        if self._initialized or not OTEL_ENABLED:
-            if not OTEL_ENABLED:
-                logger.info("Telemetry disabled via OTEL_ENABLED=false")
+        if self._initialized:
+            return
+        
+        if not OTEL_ENABLED:
+            logging.info("OpenTelemetry disabled via OTEL_ENABLED=false")
+            self._initialized = True
             return
         
         try:
@@ -128,43 +131,81 @@ class TelemetryManager:
             self.meter_provider = setup_metrics(resource)
             self.logger_provider = setup_logging(resource)
             
+            # Initialize custom metrics
+            self._metrics = self._create_custom_metrics()
+            
             self._initialized = True
-            logger.info(f"Telemetry initialized - sending to {OTEL_ENDPOINT}")
+            logging.info(f"Telemetry initialized - sending to {OTEL_ENDPOINT}")
         except Exception as e:
-            logger.error(f"Failed to initialize telemetry: {e}")
+            logging.error(f"Failed to initialize telemetry: {e}")
+            self._initialized = True  # Mark as initialized to prevent retries
+    
+    def _create_custom_metrics(self):
+        """Create custom metrics for business logic monitoring."""
+        meter = metrics.get_meter(SERVICE_NAME_VALUE)
+        
+        return {
+            "requests_total": meter.create_counter(
+                name="punky_requests_total",
+                description="Total number of API requests",
+                unit="1",
+            ),
+            "active_tasks": meter.create_up_down_counter(
+                name="punky_active_tasks",
+                description="Number of currently active agent tasks",
+                unit="1",
+            ),
+            "task_duration": meter.create_histogram(
+                name="punky_task_duration_seconds",
+                description="Duration of agent tasks",
+                unit="s",
+            ),
+            "llm_input_tokens": meter.create_counter(
+                name="punky_llm_input_tokens_total",
+                description="Total LLM input tokens consumed",
+                unit="1",
+            ),
+            "llm_output_tokens": meter.create_counter(
+                name="punky_llm_output_tokens_total",
+                description="Total LLM output tokens consumed",
+                unit="1",
+            ),
+            "llm_tokens_total": meter.create_counter(
+                name="punky_llm_tokens_total",
+                description="Total LLM tokens consumed (input + output)",
+                unit="1",
+            ),
+            "browser_sessions": meter.create_up_down_counter(
+                name="punky_browser_sessions",
+                description="Number of active browser sessions",
+                unit="1",
+            ),
+            "llm_requests": meter.create_counter(
+                name="punky_llm_requests_total",
+                description="Total number of LLM requests",
+                unit="1",
+            ),
+        }
+    
+    @property
+    def metrics(self):
+        """Get the metrics dictionary."""
+        return self._metrics
     
     def instrument_fastapi(self, app):
         """Instrument FastAPI application."""
-        if not OTEL_ENABLED:
-            return
-        try:
+        if OTEL_ENABLED:
             FastAPIInstrumentor.instrument_app(app)
-        except Exception as e:
-            logger.error(f"Failed to instrument FastAPI: {e}")
     
     def instrument_httpx(self):
         """Instrument HTTPX client for outgoing requests."""
-        if not OTEL_ENABLED:
-            return
-        try:
+        if OTEL_ENABLED:
             HTTPXClientInstrumentor().instrument()
-        except Exception as e:
-            logger.error(f"Failed to instrument HTTPX: {e}")
     
     def instrument_sqlalchemy(self, engine):
         """Instrument SQLAlchemy for database tracing."""
-        if not OTEL_ENABLED:
-            return
-        try:
+        if OTEL_ENABLED:
             SQLAlchemyInstrumentor().instrument(engine=engine)
-        except Exception as e:
-            logger.error(f"Failed to instrument SQLAlchemy: {e}")
-    
-    def get_metrics(self):
-        """Get or create custom metrics."""
-        if self._metrics is None and OTEL_ENABLED:
-            self._metrics = create_custom_metrics()
-        return self._metrics
     
     async def shutdown(self):
         """Gracefully shutdown telemetry exporters."""
@@ -175,57 +216,87 @@ class TelemetryManager:
         if self.logger_provider:
             self.logger_provider.shutdown()
         
-        logger.info("Telemetry shutdown complete")
+        logging.info("Telemetry shutdown complete")
 
 
 # Global telemetry manager instance
 telemetry = TelemetryManager()
 
 
-def create_custom_metrics():
-    """Create custom metrics for Punky API monitoring."""
-    if not OTEL_ENABLED:
-        return None
+# ============================================================
+# Helper functions for recording metrics - THESE WERE MISSING!
+# ============================================================
+
+def record_llm_tokens(input_tokens: int, output_tokens: int, model: str = "unknown"):
+    """Record LLM token usage metrics."""
+    if not OTEL_ENABLED or telemetry.metrics is None:
+        return
     
-    meter = metrics.get_meter(SERVICE_NAME_VALUE)
+    try:
+        attributes = {"model": model}
+        
+        telemetry.metrics["llm_input_tokens"].add(input_tokens, attributes)
+        telemetry.metrics["llm_output_tokens"].add(output_tokens, attributes)
+        telemetry.metrics["llm_tokens_total"].add(input_tokens + output_tokens, attributes)
+        telemetry.metrics["llm_requests"].add(1, attributes)
+    except Exception as e:
+        logging.warning(f"Failed to record LLM tokens: {e}")
+
+
+def record_browser_session_start():
+    """Record when a browser session starts."""
+    if not OTEL_ENABLED or telemetry.metrics is None:
+        return
     
-    return {
-        "requests_total": meter.create_counter(
-            name="punky_requests_total",
-            description="Total number of API requests",
-            unit="1",
-        ),
-        "active_tasks": meter.create_up_down_counter(
-            name="punky_active_tasks",
-            description="Number of currently active agent tasks",
-            unit="1",
-        ),
-        "task_duration": meter.create_histogram(
-            name="punky_task_duration_seconds",
-            description="Duration of agent tasks",
-            unit="s",
-        ),
-        "llm_tokens_used": meter.create_counter(
-            name="punky_llm_tokens_total",
-            description="Total LLM tokens consumed",
-            unit="1",
-        ),
-        "llm_requests": meter.create_counter(
-            name="punky_llm_requests_total",
-            description="Total LLM API requests",
-            unit="1",
-        ),
-        "browser_sessions": meter.create_up_down_counter(
-            name="punky_browser_sessions",
-            description="Number of active browser sessions",
-            unit="1",
-        ),
-        "training_jobs": meter.create_counter(
-            name="punky_training_jobs_total",
-            description="Total training jobs processed",
-            unit="1",
-        ),
-    }
+    try:
+        telemetry.metrics["browser_sessions"].add(1)
+    except Exception as e:
+        logging.warning(f"Failed to record browser session start: {e}")
+
+
+def record_browser_session_end():
+    """Record when a browser session ends."""
+    if not OTEL_ENABLED or telemetry.metrics is None:
+        return
+    
+    try:
+        telemetry.metrics["browser_sessions"].add(-1)
+    except Exception as e:
+        logging.warning(f"Failed to record browser session end: {e}")
+
+
+def record_task_start():
+    """Record when an agent task starts."""
+    if not OTEL_ENABLED or telemetry.metrics is None:
+        return
+    
+    try:
+        telemetry.metrics["active_tasks"].add(1)
+    except Exception as e:
+        logging.warning(f"Failed to record task start: {e}")
+
+
+def record_task_end(duration_seconds: float):
+    """Record when an agent task ends."""
+    if not OTEL_ENABLED or telemetry.metrics is None:
+        return
+    
+    try:
+        telemetry.metrics["active_tasks"].add(-1)
+        telemetry.metrics["task_duration"].record(duration_seconds)
+    except Exception as e:
+        logging.warning(f"Failed to record task end: {e}")
+
+
+def record_request():
+    """Record an API request."""
+    if not OTEL_ENABLED or telemetry.metrics is None:
+        return
+    
+    try:
+        telemetry.metrics["requests_total"].add(1)
+    except Exception as e:
+        logging.warning(f"Failed to record request: {e}")
 
 
 # Tracing helpers
@@ -248,51 +319,3 @@ def record_exception(exception: Exception):
     if span:
         span.record_exception(exception)
         span.set_status(trace.Status(trace.StatusCode.ERROR, str(exception)))
-
-
-# Metric recording helpers
-def record_llm_tokens(input_tokens: int, output_tokens: int, model: str = "unknown"):
-    """Record LLM token usage."""
-    metrics_obj = telemetry.get_metrics()
-    if metrics_obj:
-        metrics_obj["llm_tokens_used"].add(
-            input_tokens + output_tokens,
-            attributes={"model": model, "token_type": "total"}
-        )
-        metrics_obj["llm_requests"].add(1, attributes={"model": model})
-
-
-def record_task_start():
-    """Record a task starting."""
-    metrics_obj = telemetry.get_metrics()
-    if metrics_obj:
-        metrics_obj["active_tasks"].add(1)
-
-
-def record_task_end(duration_seconds: float, status: str = "success"):
-    """Record a task ending."""
-    metrics_obj = telemetry.get_metrics()
-    if metrics_obj:
-        metrics_obj["active_tasks"].add(-1)
-        metrics_obj["task_duration"].record(duration_seconds, attributes={"status": status})
-
-
-def record_browser_session_start():
-    """Record a browser session starting."""
-    metrics_obj = telemetry.get_metrics()
-    if metrics_obj:
-        metrics_obj["browser_sessions"].add(1)
-
-
-def record_browser_session_end():
-    """Record a browser session ending."""
-    metrics_obj = telemetry.get_metrics()
-    if metrics_obj:
-        metrics_obj["browser_sessions"].add(-1)
-
-
-def record_training_job(job_type: str, status: str = "completed"):
-    """Record a training job."""
-    metrics_obj = telemetry.get_metrics()
-    if metrics_obj:
-        metrics_obj["training_jobs"].add(1, attributes={"job_type": job_type, "status": status})
