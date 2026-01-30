@@ -1,0 +1,38 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  # Existing targets
+  - job_name: node-exporter
+    static_configs:
+      - targets:
+          - node-exporter:9100
+        labels:
+          instance: helsinki-monitoring
+
+  - job_name: cadvisor
+    static_configs:
+      - targets:
+          - 172.17.0.1:8082
+        labels:
+          instance: helsinki-monitoring
+
+  - job_name: victoriametrics
+    static_configs:
+      - targets:
+          - localhost:8428
+        labels:
+          instance: helsinki-monitoring
+
+  # NEW: Punky API metrics
+  - job_name: punky-api
+    scheme: https
+    metrics_path: /metrics
+    scrape_interval: 30s
+    static_configs:
+      - targets:
+          - api.jspriggins.com
+        labels:
+          instance: punky-api
+          environment: production
+          service: punky
