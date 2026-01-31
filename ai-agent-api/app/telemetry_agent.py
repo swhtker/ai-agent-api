@@ -1,293 +1,882 @@
 """
-Punky Agent Telemetry - Enhanced Module
-Autonomous agent observability for competing with Perplexity Comet & Claude Cowork.
+Punky API Agent Telemetry Module
+Extended telemetry for autonomous agent observability.
+
+This module provides agent-centric metrics that capture the unique behavior
+of autonomous agents - task lifecycle tracking, tool execution, provider
+health, and cost comparison vs competitors.
+
+Integrates with the base telemetry module for OpenTelemetry export.
 """
 
 import logging
+import os
 import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, Callable
-from functools import wraps
+from typing import Optional, List, Dict, Any
 
 from opentelemetry import trace, metrics
 
-try:
-    from .telemetry import telemetry, OTEL_ENABLED, SERVICE_NAME_VALUE
-except ImportError:
-    from telemetry import telemetry, OTEL_ENABLED, SERVICE_NAME_VALUE
+# Configuration
+OTEL_ENABLED = os.getenv("OTEL_ENABLED", "true").lower() == "true"
+SERVICE_NAME = os.getenv("SERVICE_NAME", "punky-api")
 
 logger = logging.getLogger(__name__)
 
-COMPETITOR_COSTS = {
-    "perplexity_pro": 0.015,
-    "claude_cowork": 0.012,
-    "chatgpt_plus": 0.020,
-    "default": 0.015,
-}
+
+# =============================================================================
+# TASK CONTEXT - Tracks metrics for a single agent task
+# =============================================================================
 
 @dataclass
 class TaskContext:
-    task_id: str
-    task_type: str
-    start_time: float = field(default_factory=time.time)
-    tokens_input: int = 0
-    tokens_output: int = 0
-    cost_usd: float = 0.0
-    steps: int = 0
-    tools_used: List[str] = field(default_factory=list)
-    llm_calls: int = 0
-    retries: int = 0
-    providers_used: List[str] = field(default_factory=list)
-    failovers: int = 0
-    max_context_used: int = 0
-    context_window_size: int = 128000
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    
+        """
+            Context for tracking agent task metrics throughout its lifecycle.
+
+                    Used as a context manager yield value to accumulate metrics during
+                        task execution. Metrics are recorded when the context exits.
+                            """
+        task_id: str
+        task_type: str
+        start_time: float = field(default_factory=time.time)
+
+    # Token tracking
+        input_tokens: int = 0
+        output_tokens: int = 0
+
+    # Cost tracking (USD)
+        cost_usd: float = 0.0
+
+    # Tool and step tracking
+        tools_used: List[str] = field(default_factory=list)
+        steps: int = 0
+
+    # LLM call tracking
+        llm_calls: int = 0
+        providers_used: List[str] = field(default_factory=list)
+
+    # Error tracking
+        errors: List[str] = field(default_factory=list)
+        retries: int = 0
+
+    # Status (set on context exit)
+        status: str = "pending"
+
     @property
     def total_tokens(self) -> int:
-        return self.tokens_input + self.tokens_output
-    
+                """Total tokens used (input + output)."""
+                return self.input_tokens + self.output_tokens
+
     @property
     def duration_seconds(self) -> float:
-        return time.time() - self.start_time
-    
-    @property
-    def context_utilization(self) -> float:
-        if self.context_window_size == 0:
-            return 0.0
-        return self.max_context_used / self.context_window_size
-    
-    def add_tokens(self, input_tokens: int, output_tokens: int):
-        self.tokens_input += input_tokens
-        self.tokens_output += output_tokens
-    
-    def add_cost(self, cost: float):
-        self.cost_usd += cost
-    
-    def increment_steps(self):
-        self.steps += 1
-    
-    def add_tool(self, tool_name: str):
-        if tool_name not in self.tools_used:
-            self.tools_used.append(tool_name)
-    
-    def add_llm_call(self, provider: str = None):
-        self.llm_calls += 1
-        if provider and provider not in self.providers_used:
-            self.providers_used.append(provider)
-    
-    def record_retry(self):
-        self.retries += 1
-    
-    def record_failover(self):
-        self.failovers += 1
+                """Duration since task start in seconds."""
+                return time.time() - self.start_time
+
+    def add_tokens(self, input_tokens: int, output_tokens: int) -> None:
+                """Add token usage to the task context."""
+                self.input_tokens += input_tokens
+                self.output_tokens += output_tokens
+
+    def add_cost(self, cost_usd: float) -> None:
+                """Add cost in USD to the task context."""
+                self.cost_usd += cost_usd
+
+    def add_tool(self, tool_name: str) -> None:
+                """Record a tool being used."""
+                if tool_name not in self.tools_used:
+                                self.tools_used.append(tool_name)
+
+            def add_llm_call(self, provider: str) -> None:
+                        """Record an LLM call."""
+                        self.llm_calls += 1
+                        if provider and provider not in self.providers_used:
+                                        self.providers_used.append(provider)
+
+                    def increment_steps(self) -> None:
+                                """Increment the step counter."""
+                                self.steps += 1
+
+    def add_error(self, error_type: str) -> None:
+                """Record an error."""
+                self.errors.append(error_type)
+
+    def add_retry(self) -> None:
+                """Record a retry attempt."""
+                self.retries += 1
+
+    def to_dict(self) -> Dict[str, Any]:
+                """Convert context to dictionary for logging/tracing."""
+                return {
+                    "task_id": self.task_id,
+                    "task_type": self.task_type,
+                    "duration_seconds": self.duration_seconds,
+                    "input_tokens": self.input_tokens,
+                    "output_tokens": self.output_tokens,
+                    "total_tokens": self.total_tokens,
+                    "cost_usd": self.cost_usd,
+                    "tools_used": self.tools_used,
+                    "steps": self.steps,
+                    "llm_calls": self.llm_calls,
+                    "providers_used": self.providers_used,
+                    "errors": self.errors,
+                    "retries": self.retries,
+                    "status": self.status,
+                }
+
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+def generate_task_id() -> str:
+        """Generate a unique task ID."""
+        return f"task_{uuid.uuid4().hex[:12]}"
+
+
+def _estimate_competitor_cost(tokens: int) -> float:
+        """
+            Estimate what this task would cost on competitors.
+
+                    Conservative estimates based on public pricing:
+                        - Perplexity Pro: ~$20/month with usage limits
+                            - Claude Pro/Cowork: ~$20/month with limits
+                                - Per-token estimate for comparison: ~$20/million tokens
+                                    """
+        return tokens * 0.00002
+
+
+# =============================================================================
+# AGENT TELEMETRY - Main telemetry class for agent observability
+# =============================================================================
 
 class AgentTelemetry:
+        """
+            Extended telemetry for autonomous agent observability.
+
+                    Provides metrics that capture the unique behavior of autonomous agents:
+                        - Task lifecycle (start, steps, completion, failure)
+                            - Tool execution tracking
+                                - Provider health and failover monitoring
+                                    - Cost comparison vs competitors
+                                        - Context window efficiency
+
+                                                Usage:
+                                                        task_id = generate_task_id()
+                                                                with agent_telemetry.track_task(task_id, "chat") as ctx:
+                                                                            ctx.add_tokens(100, 50)
+                                                                                        ctx.add_cost(0.001)
+                                                                                                    ctx.increment_steps()
+                                                                                                        """
+
     def __init__(self):
-        self._initialized = False
-        self._metrics = None
-        self._tracer = None
-    
-    def _ensure_initialized(self):
-        if self._initialized:
-            return
-        if not OTEL_ENABLED:
-            logger.info("Agent telemetry disabled (OTEL_ENABLED=false)")
-            self._initialized = True
-            return
-        try:
-            self._init_metrics()
-            self._tracer = trace.get_tracer(f"{SERVICE_NAME_VALUE}-agent")
-            self._initialized = True
-            logger.info("Agent telemetry initialized")
-        except Exception as e:
+                self._initialized = False
+                self._metrics: Dict[str, Any] = {}
+                self._tracer = None
+
+    def _ensure_initialized(self) -> None:
+                """Lazy initialization of metrics."""
+                if self._initialized:
+                                return
+
+                if not OTEL_ENABLED:
+                                logger.info("Agent telemetry disabled (OTEL_ENABLED=false)")
+                                self._initialized = True
+                                return
+
+                try:
+                                self._init_metrics()
+                                self._tracer = trace.get_tracer("punky-agent")
+                                self._initialized = True
+                                logger.info("Agent telemetry initialized")
+except Exception as e:
             logger.error(f"Failed to initialize agent telemetry: {e}")
-            self._initialized = True
-    
-    def _init_metrics(self):
-        meter = metrics.get_meter(f"{SERVICE_NAME_VALUE}-agent")
+            self._initialized = True  # Prevent retries
+
+    def _init_metrics(self) -> None:
+                """Initialize agent-specific OpenTelemetry metrics."""
+                meter = metrics.get_meter("punky-agent", "1.0.0")
+
         self._metrics = {
-            "tasks_total": meter.create_counter("punky_agent_tasks_total", description="Total agent tasks", unit="1"),
-            "task_duration": meter.create_histogram("punky_agent_task_duration_seconds", description="Task duration", unit="s"),
-            "task_cost": meter.create_histogram("punky_agent_task_cost_usd", description="Cost per task", unit="1"),
-            "task_steps": meter.create_histogram("punky_agent_task_steps", description="Steps per task", unit="1"),
-            "task_tokens": meter.create_histogram("punky_agent_task_tokens_total", description="Tokens per task", unit="1"),
-            "task_llm_calls": meter.create_histogram("punky_agent_task_llm_calls", description="LLM calls per task", unit="1"),
-            "tool_executions": meter.create_counter("punky_tool_executions_total", description="Tool executions", unit="1"),
-            "tool_duration": meter.create_histogram("punky_tool_duration_seconds", description="Tool duration", unit="s"),
-            "tool_errors": meter.create_counter("punky_tool_errors_total", description="Tool errors", unit="1"),
-            "provider_requests": meter.create_counter("punky_provider_requests_total", description="Provider requests", unit="1"),
-            "provider_failovers": meter.create_counter("punky_provider_failovers_total", description="Failovers", unit="1"),
-            "provider_latency": meter.create_histogram("punky_provider_latency_seconds", description="Provider latency", unit="s"),
-            "cost_savings": meter.create_counter("punky_cost_savings_usd_total", description="Cost savings vs competitors", unit="1"),
-            "cost_by_feature": meter.create_counter("punky_cost_by_feature_usd_total", description="Cost by feature", unit="1"),
-            "context_utilization": meter.create_histogram("punky_context_utilization_ratio", description="Context utilization", unit="1"),
-            "context_truncations": meter.create_counter("punky_context_truncations_total", description="Context truncations", unit="1"),
-            "task_retries": meter.create_counter("punky_agent_task_retries_total", description="Task retries", unit="1"),
-            "active_tasks": meter.create_up_down_counter("punky_agent_active_tasks", description="Active tasks", unit="1"),
+                        # ===================
+            # Task Lifecycle
+            # ===================
+            "tasks_total": meter.create_counter(
+                                name="punky_agent_tasks_total",
+                                description="Total agent tasks by type and status",
+                                unit="1",
+            ),
+                        "task_duration": meter.create_histogram(
+                                            name="punky_agent_task_duration_seconds",
+                                            description="Task duration in seconds",
+                                            unit="s",
+                        ),
+                        "task_steps": meter.create_histogram(
+                                            name="punky_agent_task_steps",
+                                            description="Number of steps per task",
+                                            unit="1",
+                        ),
+                        "task_cost": meter.create_histogram(
+                                            name="punky_agent_task_cost_usd",
+                                            description="Cost per task in USD",
+                                            unit="1",
+                        ),
+                        "task_tokens": meter.create_histogram(
+                                            name="punky_agent_task_tokens",
+                                            description="Tokens used per task",
+                                            unit="1",
+                        ),
+                        "task_retries": meter.create_counter(
+                                            name="punky_agent_task_retries_total",
+                                            description="Total retry attempts",
+                                            unit="1",
+                        ),
+                        "active_tasks": meter.create_up_down_counter(
+                                            name="punky_agent_active_tasks",
+                                            description="Currently active tasks",
+                                            unit="1",
+                        ),
+
+                        # ===================
+                        # Tool Execution
+                        # ===================
+                        "tool_executions": meter.create_counter(
+                                            name="punky_tool_executions_total",
+                                            description="Tool executions by name and status",
+                                            unit="1",
+                        ),
+                        "tool_duration": meter.create_histogram(
+                                            name="punky_tool_duration_seconds",
+                                            description="Tool execution duration",
+                                            unit="s",
+                        ),
+
+                        # ===================
+                        # Provider Health
+                        # ===================
+                        "provider_requests": meter.create_counter(
+                                            name="punky_provider_requests_total",
+                                            description="Requests per provider",
+                                            unit="1",
+                        ),
+                        "provider_latency": meter.create_histogram(
+                                            name="punky_provider_latency_seconds",
+                                            description="Provider request latency",
+                                            unit="s",
+                        ),
+                        "provider_errors": meter.create_counter(
+                                            name="punky_provider_errors_total",
+                                            description="Provider errors by type",
+                                            unit="1",
+                        ),
+                        "provider_failovers": meter.create_counter(
+                                            name="punky_provider_failovers_total",
+                                            description="Failover events between providers",
+                                            unit="1",
+                        ),
+
+                        # ===================
+                        # Cost Optimization
+                        # ===================
+                        "cost_savings": meter.create_counter(
+                                            name="punky_cost_savings_usd_total",
+                                            description="Estimated savings vs commercial alternatives",
+                                            unit="1",
+                        ),
+                        "llm_calls_total": meter.create_counter(
+                                            name="punky_agent_llm_calls_total",
+                                            description="Total LLM calls across all tasks",
+                                            unit="1",
+                        ),
+
+                        # ===================
+                        # Context Efficiency
+                        # ===================
+                        "context_utilization": meter.create_histogram(
+                                            name="punky_context_utilization_ratio",
+                                            description="Context window utilization (0-1)",
+                                            unit="1",
+                        ),
+                        "context_truncations": meter.create_counter(
+                                            name="punky_context_truncations_total",
+                                            description="Times context was truncated",
+                                            unit="1",
+                        ),
         }
 
     @contextmanager
-    def track_task(self, task_id: str = None, task_type: str = "generic"):
-        self._ensure_initialized()
-        task_id = task_id or str(uuid.uuid4())[:8]
+    def track_task(self, task_id: str, task_type: str):
+                """
+                        Context manager for tracking full task lifecycle.
+
+                                        Args:
+                                                    task_id: Unique identifier for the task
+                                                                task_type: Type of task (chat, research, browser_automation, etc.)
+
+                                                                                Yields:
+                                                                                            TaskContext: Context object to accumulate metrics
+                                                                                                    
+                                                                                                            Example:
+                                                                                                                        with agent_telemetry.track_task(task_id, "chat") as ctx:
+                                                                                                                                        result = await process_chat(messages)
+                                                                                                                                                        ctx.add_tokens(result.input_tokens, result.output_tokens)
+                                                                                                                                                                        ctx.add_cost(result.cost_usd)
+                                                                                                                                                                                """
+                self._ensure_initialized()
+
         ctx = TaskContext(task_id=task_id, task_type=task_type)
-        status = "success"
-        
-        if self._metrics:
-            self._metrics["active_tasks"].add(1, {"task_type": task_type})
-        
-        span = self._tracer.start_span(f"agent_task_{task_type}") if self._tracer else None
-        if span:
-            span.set_attribute("task.id", task_id)
-            span.set_attribute("task.type", task_type)
-        
+        span = None
+
+        # Start span if tracing is enabled
+        if self._tracer:
+                        span = self._tracer.start_span(f"agent_task_{task_type}")
+                        span.set_attribute("task.id", task_id)
+                        span.set_attribute("task.type", task_type)
+
+        # Record active task start
+        if self._metrics.get("active_tasks"):
+                        self._metrics["active_tasks"].add(1, {"task_type": task_type})
+
         try:
-            yield ctx
-        except Exception as e:
-            status = "failed"
+                        yield ctx
+                        ctx.status = "success"
+except Exception as e:
+                ctx.status = "failed"
+                ctx.add_error(type(e).__name__)
+                if span:
+                                    span.record_exception(e)
+                                raise
+finally:
+                duration = ctx.duration_seconds
+
+            # Record all metrics
+                self._record_task_metrics(ctx, duration)
+
+            # Record active task end
+            if self._metrics.get("active_tasks"):
+                                self._metrics["active_tasks"].add(-1, {"task_type": task_type})
+
+            # Set span attributes and end
             if span:
-                span.record_exception(e)
-            raise
-        finally:
-            duration = ctx.duration_seconds
-            if span:
-                span.set_attribute("task.duration_seconds", duration)
-                span.set_attribute("task.cost_usd", ctx.cost_usd)
-                span.set_attribute("task.tokens_total", ctx.total_tokens)
-                span.set_attribute("task.status", status)
-                span.end()
-            
-            if self._metrics:
-                attrs = {"task_type": task_type, "status": status}
-                self._metrics["tasks_total"].add(1, attrs)
-                self._metrics["active_tasks"].add(-1, {"task_type": task_type})
-                self._metrics["task_duration"].record(duration, {"task_type": task_type})
-                self._metrics["task_cost"].record(ctx.cost_usd, {"task_type": task_type})
-                self._metrics["task_steps"].record(ctx.steps, {"task_type": task_type})
-                self._metrics["cost_by_feature"].add(ctx.cost_usd, {"feature": task_type})
-                
-                competitor_cost = self._estimate_competitor_cost(ctx.total_tokens)
-                savings = max(0, competitor_cost - ctx.cost_usd)
-                if savings > 0:
-                    self._metrics["cost_savings"].add(savings)
-            
-            logger.info(f"Task {task_id}: {status} in {duration:.2f}s, cost=${ctx.cost_usd:.6f}")
-    
+                                span.set_attribute("task.duration_seconds", duration)
+                                span.set_attribute("task.status", ctx.status)
+                                span.set_attribute("task.tokens", ctx.total_tokens)
+                                span.set_attribute("task.cost_usd", ctx.cost_usd)
+                                span.set_attribute("task.steps", ctx.steps)
+                                span.set_attribute("task.llm_calls", ctx.llm_calls)
+                                span.set_attribute("task.tools_used", ",".join(ctx.tools_used))
+                                span.end()
+
+            # Log task completion
+            logger.info(
+                                f"Task {task_id} ({task_type}) completed: "
+                                f"status={ctx.status}, duration={duration:.2f}s, "
+                                f"tokens={ctx.total_tokens}, cost=${ctx.cost_usd:.6f}, "
+                                f"steps={ctx.steps}"
+            )
+
+    def _record_task_metrics(self, ctx: TaskContext, duration: float) -> None:
+                """Record all task metrics to OpenTelemetry."""
+                if not OTEL_ENABLED or not self._metrics:
+                                return
+
+                try:
+                                attributes = {
+                                                    "task_type": ctx.task_type,
+                                                    "status": ctx.status,
+                                }
+
+            # Task lifecycle metrics
+                    if self._metrics.get("tasks_total"):
+                                        self._metrics["tasks_total"].add(1, attributes)
+
+            if self._metrics.get("task_duration"):
+                                self._metrics["task_duration"].record(duration, {"task_type": ctx.task_type})
+
+            if self._metrics.get("task_steps"):
+                                self._metrics["task_steps"].record(ctx.steps, {"task_type": ctx.task_type})
+
+            if self._metrics.get("task_cost"):
+                                self._metrics["task_cost"].record(ctx.cost_usd, {"task_type": ctx.task_type})
+
+            if self._metrics.get("task_tokens"):
+                                self._metrics["task_tokens"].record(ctx.total_tokens, {"task_type": ctx.task_type})
+
+            if self._metrics.get("task_retries") and ctx.retries > 0:
+                                self._metrics["task_retries"].add(ctx.retries, {"task_type": ctx.task_type})
+
+            if self._metrics.get("llm_calls_total") and ctx.llm_calls > 0:
+                                self._metrics["llm_calls_total"].add(ctx.llm_calls, {"task_type": ctx.task_type})
+
+            # Calculate and record cost savings vs competitors
+            if ctx.total_tokens > 0 and self._metrics.get("cost_savings"):
+                                competitor_cost = _estimate_competitor_cost(ctx.total_tokens)
+                                savings = max(0, competitor_cost - ctx.cost_usd)
+                                if savings > 0:
+                                                        self._metrics["cost_savings"].add(savings, {"task_type": ctx.task_type})
+
+except Exception as e:
+            logger.warning(f"Failed to record task metrics: {e}")
+
     @contextmanager
-    def track_tool(self, tool_name: str, task_ctx: TaskContext = None):
-        self._ensure_initialized()
+    def track_tool(self, tool_name: str, task_ctx: Optional[TaskContext] = None):
+                """
+                        Track individual tool execution.
+
+                                        Args:
+                                                    tool_name: Name of the tool being executed
+                                                                task_ctx: Optional parent task context
+
+                                                                                Example:
+                                                                                            with agent_telemetry.track_tool("browser_navigate", task_ctx):
+                                                                                                            await browser.navigate(url)
+                                                                                                                    """
+                self._ensure_initialized()
+
         start = time.time()
-        status = "success"
-        span = self._tracer.start_span(f"tool_{tool_name}") if self._tracer else None
-        
+        span = None
+
+        if self._tracer:
+                        span = self._tracer.start_span(f"tool_{tool_name}")
+                        span.set_attribute("tool.name", tool_name)
+
         try:
-            yield
+                        yield
+                        status = "success"
+except Exception as e:
+                status = "failed"
+                if span:
+                                    span.record_exception(e)
+                                raise
+finally:
+                duration = time.time() - start
+
+            # Record tool metrics
+                if OTEL_ENABLED and self._metrics:
+                                    try:
+                                                            if self._metrics.get("tool_executions"):
+                                                                                        self._metrics["tool_executions"].add(
+                                                                                                                        1, {"tool": tool_name, "status": status}
+                                                                                            )
+                                                                                    if self._metrics.get("tool_duration"):
+                                                                                                                self._metrics["tool_duration"].record(
+                                                                                                                                                duration, {"tool": tool_name}
+                                                                                                                    )
+                                        except Exception as e:
+                    logger.warning(f"Failed to record tool metrics: {e}")
+
+            # Update task context
             if task_ctx:
-                task_ctx.add_tool(tool_name)
-        except Exception as e:
-            status = "failed"
+                                task_ctx.add_tool(tool_name)
+
+            # End span
             if span:
-                span.record_exception(e)
-            if self._metrics:
-                self._metrics["tool_errors"].add(1, {"tool": tool_name, "error_type": type(e).__name__})
-            raise
-        finally:
-            duration = time.time() - start
-            if span:
-                span.set_attribute("tool.duration_seconds", duration)
-                span.end()
-            if self._metrics:
-                self._metrics["tool_executions"].add(1, {"tool": tool_name, "status": status})
-                self._metrics["tool_duration"].record(duration, {"tool": tool_name})
+                              " " "s
+pPaunn.ksye tA_PaIt tArgiebnutt eT(e"lteomoelt.rdyu rMaotdiuolne_
+sEexctoennddse"d,  tdeulreamteitorny) 
+f o r   a u t o n o m o u s   a gsepnatn .osbeste_ravtatbriilbiuttye.(
+"
+tTohoils. smtoadtuulse" ,p rsotvaitduess) 
+a g e n t - c e n t r i c   m e tsrpiacns. etnhda(t) 
+c a p t u
+r e   t hdee fu nrieqcuoer db_ephraovviiodre
+ro_fr eaquuteosnto(m
+o u s   a g e n tsse l-f ,t
+a s k   l i f e cpyrcolvei dterra:c ksitnrg,,
+  t o o l   e x emcoudteilo:n ,s tprr,o
+  v i d e r 
+   h e allatthe,n cayn_ds eccoosntd sc:o mfplaoraits,o
+   n   v s   c o m pseutcicteosrss:. 
+   b
+   oIonlt,e
+   g r a t e s   w ittahs kt_hcet xb:a sOep ttieolneamle[tTrays kmCoodnutleex tf]o r=  ONpoenneT,e
+   l e m e t r y   eexrproorrt_.t
+   y"p"e":
 
-    def record_provider_request(self, provider: str, model: str, latency_seconds: float, success: bool, task_ctx: TaskContext = None):
-        self._ensure_initialized()
-        if task_ctx:
-            task_ctx.add_llm_call(provider)
-        if self._metrics:
-            self._metrics["provider_requests"].add(1, {"provider": provider, "model": model, "success": str(success).lower()})
-            self._metrics["provider_latency"].record(latency_seconds, {"provider": provider, "model": model})
-    
-    def record_failover(self, from_provider: str, to_provider: str, reason: str, task_ctx: TaskContext = None):
-        self._ensure_initialized()
-        if task_ctx:
-            task_ctx.record_failover()
-        if self._metrics:
-            self._metrics["provider_failovers"].add(1, {"from_provider": from_provider, "to_provider": to_provider, "reason": reason})
-        logger.warning(f"Provider failover: {from_provider} -> {to_provider} ({reason})")
-    
-    def record_context_truncation(self, model: str, original_tokens: int, truncated_to: int):
-        self._ensure_initialized()
-        if self._metrics:
-            self._metrics["context_truncations"].add(1, {"model": model})
-        logger.info(f"Context truncated: {original_tokens} -> {truncated_to} for {model}")
+    Oipmtpioornta ll[osgtgri]n g=
+     iNmopnoer,t
+       o s 
+        i)m p-o>r tN otniem:e
 
-        def record_chat_task(
-                    self,
-                    model: str = "unknown",
-                    input_tokens: int = 0,
-                    output_tokens: int = 0,
-                    cost_eur: float = 0.0,
-                    success: bool = True,
-                    error_type: str = None,
-        ):
-                    """Record a chat task for dashboard metrics."""
-                    self._ensure_initialized()
-                    total_tokens = input_tokens + output_tokens
-                    status = "success" if success else "failed"
-                    cost_usd = cost_eur / 0.92 if cost_eur else 0.0
+         i m p o r t   u"u"i"d
 
-            if self._metrics:
-                            self._metrics["tasks_total"].add(1, {"task_type": "chat", "status": status})
-                            self._metrics["task_tokens"].record(total_tokens, {"task_type": "chat"})
-                            if cost_usd > 0:
-                                                self._metrics["task_cost"].record(cost_usd, {"task_type": "chat"})
-                                            self._metrics["provider_requests"].add(1, {"provider": "routellm", "model": model, "success": str(success).lower()})
-                            if not success and error_type:
-                                                self._metrics["tool_errors"].add(1, {"tool": "chat", "error_type": error_type})
-                                            savings = max(0, self._estimate_competitor_cost(total_tokens) - cost_usd)
-                            if savings > 0:
-                                                self._metrics["cost_savings"].add(savings)
+          f r o m   c o nRteecxotrldi bp riomvpiodretr -cloenvteelx tmmeatnraigcesr.
 
-            if success:
-                            logger.info(f"Chat task: model={model}, tokens={total_tokens}, cost=EUR{cost_eur:.6f}")
-            else:
-                            logger.warning(f"Chat task failed: model={model}, error={error_type}")
-                
-    def _estimate_competitor_cost(self, total_tokens: int) -> float:
-        avg_rate = sum(COMPETITOR_COSTS.values()) / len(COMPETITOR_COSTS)
-        return (total_tokens / 1000) * avg_rate
+          f r o m   d a t a
+          c l a s s e s   iAmrpgosr:t
+            d a t a c l a s s ,   fpireolvdi
+            dferro:m  Ptryopviindge ri mnpaomret  (Ooppteinoania,l ,a nLtihsrto,p iDci,c tr,o uAtneyl
+            l
+            mf,r oemt co.p)e
+            n t e l e m e t r y   i mmpoodretl :t rMaocdee,l  mneatmrei cuss
+            e
+            d#
+              C o n f i g u r a t i olna
+              tOeTnEcLy__EsNeAcBoLnEdDs :=  Roesq.ugeestte nlva(t"eOnTcEyL
+              _ E N A B L E D " ,   " tsruucec"e)s.sl:o wWehre(t)h e=r=  t"hter uree"q
+              uSeEsRtV IsCuEc_cNeAeMdEe d=
+                o s . g e t e n v ( " StEaRsVkI_CcEt_xN:A MOEp"t,i o"npauln kpya-raepnit" )t
+                a
+                slko gcgoenrt e=x tl
+                o g g i n g . g e t L o gegrerro(r___tnyapmee:_ _E)r
+                r
+                o
+                r#  t=y=p=e= =i=f= =r=e=q=u=e=s=t= =f=a=i=l=e=d=
+                = = = = = = = = ="="="=
+                = = = = = = = = =s=e=l=f=.=_=e=n=s=u=r=e=_=i=n=i=t=i=a=l=i=z=e=d=(=)=
+                = = = = = = = = 
 
+                #   T A S K   C OiNfT EnXoTt  -O TTErLa_cEkNsA BmLeEtDr iocrs  nfootr  sae lsfi.n_gmleet raigcesn:t
+                  t a s k 
+                   #   = = = = =r=e=t=u=r=n=
+                   = = = = = = = = =
+                   = = = = = = = = =t=r=y=:=
+                   = = = = = = = = = = = = =a=t=t=r=i=b=u=t=e=s= === ={=
+                   = = = = = = = = = = = = = = = = ="
+                   p
+                   r@odvaitdaecrl"a:s sp
+                   rcolvaisdse rT,a
+                   s k C o n t e x t : 
+                            " """m
+                            o d e l "C:o nmtoedxetl ,f
+                            o r   t r a c k i n g   a g e n t" stuacscke smse"t:r isctsr (tshurcocuegshso)u.tl oiwtesr (l)i,f
+                            e c y c l e . 
 
-def track_agent_task(task_type: str = "generic"):
-    def decorator(func: Callable):
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            task_id = kwargs.get("task_id") or str(uuid.uuid4())[:8]
-            with agent_telemetry.track_task(task_id, task_type) as ctx:
-                if "task_ctx" in func.__code__.co_varnames:
-                    kwargs["task_ctx"] = ctx
-                return await func(*args, **kwargs)
-        return wrapper
-    return decorator
+                                     } 
+                                           U s e d   a s   a  
+                                           c o n t e x t   m a n a giefr  syeilefl.d_ mveatlruiec st.og eatc(c"upmruolvaitdee rm_erterqiucess tdsu"r)i:n
+                                           g 
+                                                    t a s k   e x e c u tsieolnf.. _Mmeettrriiccss [a"rper orveicdoerrd_erde qwuheesnt st"h]e. acdodn(t1e,x ta tetxriitbsu.t
+                                                    e s ) 
+                                                      " " " 
+                                                               t a s k
+                                                               _ i d :   s t r 
+                                                                       itfa sske_ltfy.p_em:e tsrtirc
+                                                                       s . g e ts(t"aprrto_vtiidmeer:_ lfaltoeantc y=" )f:i
+                                                                       e l d ( d e f a u l t _ f a c t osreyl=ft.i_mmee.ttriimces)[
+                                                                       " p r o v
+                                                                       i d e r _#l aTtoeknecny "t]r.arcekcionrgd
+                                                                       ( 
+                                                                             i n p u t _ t o k e n s :   i n t  l=a t0e
+                                                                             n c y _ soeuctopnudts_,t o{k"epnrso:v iidnetr "=:  0p
+                                                                             r o v i d
+                                                                             e r ,   "#m oCdoeslt" :t rmaocdkeiln}g
+                                                                               ( U S D ) 
+                                                                                        c o s t _ u)s
+                                                                                        d :   f l o a t   =   0 .
+                                                                                        0 
 
-
-def track_tool_execution(tool_name: str):
-    def decorator(func: Callable):
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            task_ctx = kwargs.get("task_ctx")
-            with agent_telemetry.track_tool(tool_name, task_ctx):
-                return await func(*args, **kwargs)
-        return wrapper
-    return decorator
-
-
-agent_telemetry = AgentTelemetry()
-
-
-def generate_task_id() -> str:
-    return str(uuid.uuid4())[:8]
+                                                                                                          #  iTfo onlo ta nsdu cscteesps  tarnadc keirnrgo
+                                                                                                          r _ t y pteo oalnsd_ usseeldf:. _Lmiesttr[isctsr.]g e=t (f"iperlodv(iddeefra_uelrtr_ofrasc"t)o:r
+                                                                                                          y = l i s t ) 
+                                                                                                                   s t e p ss:e lifn.t_ m=e t0r
+                                                                                                                   i c s [ "
+                                                                                                                   p r o v i#d eLrL_Me rcraolrls "t]r.aacdkdi(n
+                                                                                                                   g 
+                                                                                                                            l l m _ c a l l s :   i n t  1=,  0{
+                                                                                                                            " p r o vpirdoevri"d:e rpsr_ouvsiedde:r ,L i"setr[rsotrr_]t y=p ef"i:e ledr(rdoerf_atuylpte_}f
+                                                                                                                            a c t o r y = l i s t ) 
+                                                                                                                                    )
+                                                                                                                                    
+                                                                                                                                            #   E r r o r   t
+                                                                                                                                            r a c k i n g 
+                                                                                                                                              e x c eeprtr oErxsc:e pLtiisotn[ satsr ]e :=
+                                                                                                                                                f i e l d ( d e f a u llto_gfgaecrt.owrayr=nliinsgt()f
+                                                                                                                                                " F a i lreedt rtioe sr:e cionrtd  =p r0o
+                                                                                                                                                v i d e r
+                                                                                                                                                  m e t r#i cSst:a t{ues} "()s
+                                                                                                                                                  e t   o n
+                                                                                                                                                    c o n tdeexft  reexciotr)d
+                                                                                                                                                    _ f a i lsotvaetru(s
+                                                                                                                                                    :   s t r   =   "speelnfd,i
+                                                                                                                                                    n g " 
+                                                                                                                                                             
+                                                                                                                                                             f r o m _@pprroovpiedretry:
+                                                                                                                                                               s t r ,d
+                                                                                                                                                               e f   t o t a l _ttoo_kpernosv(isdeelrf:)  s-t>r ,i
+                                                                                                                                                               n t : 
+                                                                                                                                                                         r e a s"o"n":T osttarl, 
+                                                                                                                                                                         t o k e n)s  -u>s eNdo n(ei:n
+                                                                                                                                                                         p u t   +   o u t"p"u"t
+                                                                                                                                                                         ) . " " " 
+                                                                                                                                                                               R e c o r dr eat ufrani lsoevlefr. ienvpeuntt_ tboektewnese n+  psreolvfi.doeurtsp.u
+                                                                                                                                                                               t _ t o k e n s 
+                                                                                                                                                                               
+                                                                                                                                                                                       
+                                                                                                                                                                                               A@rpgrso:p
+                                                                                                                                                                                               e r t y 
+                                                                                                                                                                                                        d e f  fdruorma_tpiroonv_isdeecro:n dOsr(isgeilnfa)l  -p>r ofvliodaetr: 
+                                                                                                                                                                                                        t h a t   f a i l"e"d"
+                                                                                                                                                                                                        D u r a t i o n   s i n cteo _tparsokv isdtearr:t  Pirno vsiedceorn dtsh.a"t" "h
+                                                                                                                                                                                                        a n d l e d   t hree tfuarinl otviemre
+                                                                                                                                                                                                        . t i m e ( )   -   s e lrfe.asstoanr:t _Rteiamseo
+                                                                                                                                                                                                        n   f o r
+                                                                                                                                                                                                          f a i ldoevfe ra d(dt_itmoekoeunts,( srealtfe,_ liinmpiutt,_ teorkreonrs,:  eitnct.,) 
+                                                                                                                                                                                                          o u t p u t _ t o"k"e"n
+                                                                                                                                                                                                          s :   i n t )   -s>e lNfo.n_ee:n
+                                                                                                                                                                                                          s u r e _ i n i t"i"a"lAidzde dt(o)k
+                                                                                                                                                                                                          e n   u s a g e  
+                                                                                                                                                                                                          t o   t h e   t aisfk  ncootn tOeTxEtL._"E"N"A
+                                                                                                                                                                                                          B L E D   o r   nsoetl fs.eilnfp.u_tm_ettorkiecnss: 
+                                                                                                                                                                                                          + =   i n p u t _ t o k ernest
+                                                                                                                                                                                                          u r n 
+                                                                                                                                                                                                                    s e l f
+                                                                                                                                                                                                                    . o u t p u t _ ttorkye:n
+                                                                                                                                                                                                                    s   + =   o u t p u t _ tiofk esnesl
+                                                                                                                                                                                                                    f . _ m e
+                                                                                                                                                                                                                    t r i c sd.egfe ta(d"dp_rcoovsitd(esre_lffa,i lcoovsetr_su"s)d::
+                                                                                                                                                                                                                      f l o a t )   - >   N o n e : 
+                                                                                                                                                                                                                      s e l f . _ m e t"r"i"cAsd[d" pcroosvti dienr _UfSaDi ltoov etrhse" ]t.aasdkd (c
+                                                                                                                                                                                                                      o n t e x t . " " " 
+                                                                                                                                                                                                                                       s e1l,f .{c"ofsrto_mu"s:d  f+r=o mc_opsrto_vuisdde
+                                                                                                                                                                                                                                       r ,   " t
+                                                                                                                                                                                                                                       o " :   tdoe_fp raodvdi_dteoro,l ("sreelafs,o nt"o:o lr_enaasmoen:} 
+                                                                                                                                                                                                                                       s t r )   - >   N o n e : 
+                                                                                                                                                                                                                                             ) 
+                                                                                                                                                                                                                                                     " " " R e c o r d
+                                                                                                                                                                                                                                                       a   t o o l   b e i n gl ougsgeedr.."w"a"r
+                                                                                                                                                                                                                                                       n i n g ( 
+                                                                                                                                                                                                                                                             i f   t o o l _ n a m e   nfo"tP rionv isdeelrf .ftaoiollosv_eurs:e d{:f
+                                                                                                                                                                                                                                                             r o m _ p r o v i d e r }s e-l>f .{ttooo_lpsr_ouvsiedde.ra}p p(erneda(stoono:l _{nraemaes)o
+                                                                                                                                                                                                                                                             n } ) " 
+                                                                                                                                                                                                                                                             
+                                                                                                                                                                                                                                                                      d e f   a d d _)l
+                                                                                                                                                                                                                                                                      l m _ c a l l ( seexlcfe,p tp rEoxvciedpetri:o ns tars)  e-:>
+                                                                                                                                                                                                                                                                        N o n e : 
+                                                                                                                                                                                                                                                                                    l o g"g"e"rR.ewcaorrndi nagn( fL"LFMa iclaeldl .t"o" "r
+                                                                                                                                                                                                                                                                                    e c o r d   f a isleolvfe.rl:l m{_ec}a"l)l
+                                                                                                                                                                                                                                                                                    s   + =  
+                                                                                                                                                                                                                                                                                    1 
+                                                                                                                                                                                                                                                                                          d e f   r eicfo rpdr_ocvoindteerx ta_nudt iplriozvaitdieorn (n
+                                                                                                                                                                                                                                                                                          o t   i n   s e lsfe.lpfr,o
+                                                                                                                                                                                                                                                                                          v i d e r s _ u suesde:d
+                                                                                                                                                                                                                                                                                          _ t o k e n s :   i n t ,s
+                                                                                                                                                                                                                                                                                          e l f . p r o v imdaexr_st_oukseends.:a pipnetn,d
+                                                                                                                                                                                                                                                                                          ( p r o v i d e rt)r
+                                                                                                                                                                                                                                                                                          u n c a t
+                                                                                                                                                                                                                                                                                          e d :   bdoeofl  i=n cFraelmseen,t
+                                                                                                                                                                                                                                                                                          _ s t e p)s (-s>e lNfo)n e-:>
+                                                                                                                                                                                                                                                                                            N o n e : 
+                                                                                                                                                                                                                                                                                                " " " 
+                                                                                                                                                                                                                                                                                                      " " " I n cRreecmoerndt  ctohnet esxtte pw icnoduonwt eurt.i"l"i"z
+                                                                                                                                                                                                                                                                                                      a t i o n . 
+                                                                                                                                                                                                                                                                                                          s e l f . s t
+                                                                                                                                                                                                                                                                                                          e p s   + =   1 
+                                                                                                                                                                                                                                                                                                          A r g s :
+                                                                                                                                                                                                                                                                                                          
+                                                                                                                                                                                                                                                                                                                  d e f   a d d _ eursreodr_(tsoeklefn,s :e rTrookre_ntsy pues:e ds tirn)  t-h>e  Ncoonnet:e
+                                                                                                                                                                                                                                                                                                                  x t 
+                                                                                                                                                                                                                                                                                                                              " " " R e c omradx _atno keernrso:r .M"a"x"i
+                                                                                                                                                                                                                                                                                                                              m u m   c o n t esxetl fw.ienrdroowr ss.iazpep
+                                                                                                                                                                                                                                                                                                                              e n d ( e r r o r _ t y pter)u
+                                                                                                                                                                                                                                                                                                                              n c a t e
+                                                                                                                                                                                                                                                                                                                              d :   W hdeetfh eard dt_hree tcroyn(tseexltf )w a-s>  tNrounnec:a
+                                                                                                                                                                                                                                                                                                                              t e d 
+                                                                                                                                                                                                                                                                                                                                        " " " R"e"c"o
+                                                                                                                                                                                                                                                                                                                                        r d   a   r e t rsye laft.t_eemnpstu.r"e"_"i
+                                                                                                                                                                                                                                                                                                                                        n i t i a l i z esde(l)f
+                                                                                                                                                                                                                                                                                                                                        . r e t r i e s  
+                                                                                                                                                                                                                                                                                                                                        + =   1 
+                                                                                                                                                                                                                                                                                                                                                i
+                                                                                                                                                                                                                                                                                                                                                f   n o td eOfT EtLo__EdNiAcBtL(EsDe lofr)  n-o>t  Dsiecltf[.s_tmre,t rAincys]::
+                                                                                                                                                                                                                                                                                                                                                
+                                                                                                                                                                                                                                                                                                                                                                 " " " Croentvuerrnt
+                                                                                                                                                                                                                                                                                                                                                                   c o n t e x t  
+                                                                                                                                                                                                                                                                                                                                                                   t o   d i c t i otnrayr:y
+                                                                                                                                                                                                                                                                                                                                                                     f o r   l o g g i n g /rtartaicoi n=g .u"s"e"d
+                                                                                                                                                                                                                                                                                                                                                                     _ t o k e n s   /r emtauxr_nt o{k
+                                                                                                                                                                                                                                                                                                                                                                     e n s   i f   m a x _ t o"kteanssk _>i d0" :e lsseel f0.
+                                                                                                                                                                                                                                                                                                                                                                     t a s k _ i d , 
+                                                                                                                                                                                                                                                                                                                                                                             
+                                                                                                                                                                                                                                                                                                                                                                                             " t a s ki_ft yspeel"f:. _smeeltfr.itcass.kg_etty(p"ec,o
+                                                                                                                                                                                                                                                                                                                                                                                             n t e x t _ u t i l i z a"tdiuorna"t)i:o
+                                                                                                                                                                                                                                                                                                                                                                                             n _ s e c o n d s " :   s e l f .sdeulrfa.t_imoent_rsieccso[n"dcso,n
+                                                                                                                                                                                                                                                                                                                                                                                             t e x t _ u t i l i z a t"iionnp"u]t._rteockoernds("r:a tsieol)f
+                                                                                                                                                                                                                                                                                                                                                                                             . i n p u t _ t o k e n s
+                                                                                                                                                                                                                                                                                                                                                                                             , 
+                                                                                                                                                                                                                                                                                                                                                                                                                   i f" oturtupnucta_tteodk eannsd" :s eslefl.f_.moeuttrpiucts_.tgoekte(n"sc,o
+                                                                                                                                                                                                                                                                                                                                                                                                                   n t e x t _ t r u n c a t"itoontsa"l)_:t
+                                                                                                                                                                                                                                                                                                                                                                                                                   o k e n s " :   s e l f . t o t asle_ltfo.k_emnest,r
+                                                                                                                                                                                                                                                                                                                                                                                                                   i c s [ " c o n t e x t _"tcrousntc_autsido"n:s "s]e.lafd.dc(o1s)t
+                                                                                                                                                                                                                                                                                                                                                                                                                   _ u s d , 
+                                                                                                                                                                                                                                                                                                                                                                                                                                 
+                                                                                                                                                                                                                                                                                                                                                                                                                                           " t o oelxsc_eupste dE"x:c espetlifo.nt oaosl se_:u
+                                                                                                                                                                                                                                                                                                                                                                                                                                           s e d , 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                           l o g g e"rs.tweaprsn"i:n gs(efl"fF.asitleepds ,t
+                                                                                                                                                                                                                                                                                                                                                                                                                                                           o   r e c o r d   c o n t"elxltm _uctailllisz"a:t isoenl:f .{lel}m"_)c
+                                                                                                                                                                                                                                                                                                                                                                                                                                                           a l l s ,
+                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                   d e f   r e c o r"dp_rborvoiwdseerrs__aucsteido"n:( 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                   s e l f . p r o vsiedlefr,s
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                   _ u s e d , 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                       a c t i o n _ t y p e":e rsrtorr,s
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                       " :   s e l f . esrurcocress,s
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                       :   b o o l , 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 " r e tdruireast"i:o ns_eslefc.ornedtsr:i eOsp,t
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 i o n a l [ f l o a t ]  "=s tNaotnues,"
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 :   s e l f . s ttaatsuks_,c
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 t x :   O p t i o}n
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 a
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 l
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 [#T a=s=k=C=o=n=t=e=x=t=]= === =N=o=n=e=,=
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 = = = = =)= =-=>= =N=o=n=e=:=
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 = = = = = = = = ="="="=
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 = = = = = = = = =R=e=c=o=r=d= =b=r=o=w=s=e=r= =a=u=t=o=m=a=t=i
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 o#n  HaEcLtPiEoRn .F
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 U N C T I O N S 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 #   = = = = = = =A=r=g=s=:=
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 = = = = = = = = = = = = =a=c=t=i=o=n=_=t=y=p=e=:= =T=y=p=e= =o=f= =a=c=t=i=o=n= =(=n=a=v=i=g=a=t=e=,= =c=l=i=c=k=,= =e=x=t=r=a=c=t
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 ,
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  deetfc .g)e
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  n e r a t e _ t a s k _ isdu(c)c e-s>s :s tWrh:e
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  t h e r  "t"h"eG eancetriaotne  sau cucneieqdueed 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  t a s k   I D . " " " 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    d u r arteitounr_ns efc"otnadssk:_ {Aucutiido.nu udiudr4a(t)i.ohne
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    x [ : 1 2 ] } " 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       d etfa s_ke_scttixm:a tOep_tcioomnpaelt iptaorre_ncto stta(stko kceonnst:e xitn
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       t )   - >   f l o"a"t":
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                " " " 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                s e l f .E_setnismuartee_ iwnhiatti atlhiizse dt(a)s
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                k   w o u l d   c
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                o s t   o n   c o#m pReetciotrodr sa.s
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  a   t o
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  o l   e xCeocnusteirovna
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  t i v e   e s t iimfa tOeTsE Lb_aEsNeAdB LoEnD  paunbdl isce lpfr.i_cmientgr:i
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  c s : 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    -   P e r p l e x i t yt rPyr:o
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    :   ~ $ 2 0 / m o n t h   w i t hi fu ssaeglef .l_immeittrsi
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    c s . g e-t (C"ltaouodle_ ePxreoc/uCtoiwoonrsk":) :~
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    $ 2 0 / m o n t h   w i t h   l i m i t ss
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    e l f . _-m ePterri-ctso[k"etno oels_teixmeactuet ifoonrs "c]o.mapdadr(i
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    s o n :   ~ $ 2 0 / m i l l i o n   t o k e n s 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    1 ,   { 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    " " " 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             r e t u r n   t o k e n s   *   0 . 0 0 0"0t2o
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             o
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             l
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             "#:  =f="=b=r=o=w=s=e=r=_={=a=c=t=i=o=n=_=t=y=p=e=}="=,=
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             = = = = = = = = = = = = = = = = = = = = = = = = = = = = ="=s=t=a=t=u=s="=:= ="=s=u=c=c=e=s=s="= =i=f= 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             s#u cAcGeEsNsT  eTlEsLeE M"EfTaRiYl e-d "M,a
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             i n   t e l e m e t r y   c l a s s   f o r   a g}e
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             n t   o b s e r v a b i l i t y 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              #   = =)=
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              = = = = = = = = = = = = = = = = =
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              = = = = = = = = = = = = = = = = =i=f= =d=u=r=a=t=i=o=n=_=s=e=c=o=n=d=s= =a=n=d= =s=e=l=f=.=_=m=e=t=r=i=c=s=.=g=e=t
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              (
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              "ctloaosls_ dAugreanttiToenl"e)m:e
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              t r y : 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       " " " 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                E x t esnedlefd. _tmeeltermiectsr[y" tfooorl _aduutroantoimoonu"s] .argeecnotr do(b
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                s e r v a b i l i t y . 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  P r odvuirdaetsi omne_tsreiccosn dtsh,a t{ "ctaopotlu"r:e  ft"hber ouwnsieqru_e{ abcethiaovni_otry poef} "a}u
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  t o n o m o u s   a g e n t s : 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          )-
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            T a s k   l i f e c y celxec e(pstt aErxtc,e psttieopns ,a sc oem:p
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            l e t i o n ,   f a i l u r e ) 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            l o g g e-r .Twoaorln ienxge(cfu"tFiaoinl etdr atcok irnegc
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            o r d   b-r oPwrsoevri daecrt ihoena:l t{he }a"n)d
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              f a i l o v e r
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                m o n i t o r iinfg 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                t a s k _-c tCxo:s
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                t   c o m p a r i s o n  tvass kc_ocmtpxe.taidtdo_rtso
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                o l ( f "-b rCoownsteerx_t{ awcitnidoonw_ teyfpfei}c"i)e
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                n
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                c
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                y#
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  = = = =
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  = = = = =U=s=a=g=e=:=
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  = = = = = = = = =t=a=s=k=_=i=d= === =g=e=n=e=r=a=t=e=_=t=a=s=k=_=i=d=(=)=
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  = = = = = = = = =w=i=t=h= =a=g=e=n=t=_=t=e=l=e=m=e
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  t#r yG.LtOrBaAcLk _ItNaSsTkA(NtCaEs
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  k#_ i=d=,= ="=c=h=a=t="=)= =a=s= =c=t=x=:=
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  = = = = = = = = = = = = =c=t=x=.=a=d=d=_=t=o=k=e=n=s=(=1=0=0=,= =5=0=)=
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  = = = = = = = = = = = = =c=t=x=.=a=d=d=_=c=o
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  s
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  t#( 0G.l0o0b1a)l
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    a g e n t   t e l e m ecttrxy. iinncsrteamnecnet
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    _asgteenpts_(t)e
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    l e m e t"r"y" 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    =   A g e
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    n t T e ldeemfe t_r_yi(n)i
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    t
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    _
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    _#( s=e=l=f=)=:=
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    = = = = = = = = =s=e=l=f=.=_=i=n=i=t=i=a=l=i=z=e=d= === =F=a=l=s=e=
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    = = = = = = = = =s=e=l=f=.=_=m=e=t=r=i=c=s=:= =D=i=c=t=[=s=t=r=,= =A=n=y=]
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     #=  C{O}N
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     V E N I E N C E  sEeXlPfO.R_TtSr
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     a#c e=r= === =N=o=n=e=
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     = = = = =
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     = = = = =d=e=f= =_=e=n=s=u=r=e=_=i=n=i=t=i=a=l=i=z=e=d=(=s=e=l=f=)= =-=>= =N=o=n=e=:=
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     = = = = = = = = ="="="=L=a=z=y= =i=n=i=t
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     i
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     a_l_iazlalt_i_o n=  o[f
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       m e t r"iacgse.n"t"_"t
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       e l e m e t r y "i,f
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         s e l f".A_giennittTiealleimzeetdr:y
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         " , 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  " T a s k Croenttuerxnt
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  " , 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           " g
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           e n e r a t e _ tiafs kn_oitd "O,T
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           E]L
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           _ENABLED:
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       logger.info("Agent telemetry disabled (OTEL_ENABLED=false)")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   self._initialized = True
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               return
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               try:
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           self._init_metrics()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       self._tracer = trace.get_tracer("punky-agent")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   self._initialized = True
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               logger.info("Agent telemetry initialized")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       except Exception as e:
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   logger.error(f"Failed to initialize agent telemetry: {e}")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               self._initialized = True  # Prevent retries
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       def _init_metrics(self) -> None:
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               """Initialize agent-specific OpenTelemetry metrics."""
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       meter = metrics.get_meter("punky-agent", "1.0.0")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       self._metrics = {
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   # ===================
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               # Task Lifecycle
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           # ===================
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       "tasks_total": meter.create_counter(
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       name="punky_agent_tasks_total",
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       description="Total agent tasks by type and status",
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       unit="1",
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   ),
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               "task_duration": meter.create_histogram(
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               name="punky_agent_task_duration_seconds",
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               description="Task duration in seconds",
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               unit="s",
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ),
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       "task_steps": meter.create_histogram(
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       name="punky_agent_task_steps",
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       description="Number of steps per task",
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       unit="1",
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   ),
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               "task_cost": meter.create_histogram(
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               name="punky_agent_task_cost_usd",
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               description="Cost per task in USD",
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               unit="1",
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ),
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       "task_tokens": meter.create_histogram(
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       name="punky_agent_task_tokens",
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       description="Tokens used per task",
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       unit="1",
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   ),
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               "task_retries": meter.create_counter(
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               name="punky_agent_task_retries_total",
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               description="Total retry attempts",
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               unit="1",
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ),
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       "active_tasks": meter.create_up_down_counter(
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                
