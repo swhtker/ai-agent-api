@@ -13,6 +13,7 @@ from .database import get_db, init_db, engine
 from . import models
 from .routers import training, chat
 from .telemetry import telemetry, add_span_attributes, record_exception
+from .telemetry_agent import agent_telemetry  # Agent task tracking
 
 # NEW: Import production metrics
 from .prometheus_metrics_production import (
