@@ -19,6 +19,7 @@ from ..telemetry import (
     record_llm_tokens,
     record_request,
 )
+from ..telemetry_agent import agent_telemetry, generate_task_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -222,6 +223,16 @@ async def chat_completions(request: ChatRequest):
             choices = result.get("choices", [])
             if not choices:
                 raise HTTPException(status_code=500, detail="No response")
+
+                        # Record agent task metrics
+                        usage = result.get("usage", {})
+                            agent_telemetry.record_chat_task(
+                                                model=result.get("model", ROUTER_MODEL),
+                                                input_tokens=usage.get("prompt_tokens", 0),
+                                                output_tokens=usage.get("completion_tokens", 0),
+                                                cost_eur=result.get("_cost_eur", 0.0),
+                                                success=True
+                            )
             return ChatResponse(
                 response=choices[0].get("message", {}).get("content", ""),
                 model_used=result.get("model"),
@@ -233,6 +244,7 @@ async def chat_completions(request: ChatRequest):
         except Exception as e:
             record_exception(e)
             record_error_metrics(ROUTER_MODEL, "internal_error")
+                        agent_telemetry.record_chat_task(model=ROUTER_MODEL, success=False, error_type="internal_error")
             raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/health")
