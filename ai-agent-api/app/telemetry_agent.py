@@ -224,7 +224,39 @@ class AgentTelemetry:
         if self._metrics:
             self._metrics["context_truncations"].add(1, {"model": model})
         logger.info(f"Context truncated: {original_tokens} -> {truncated_to} for {model}")
-    
+
+        def record_chat_task(
+                    self,
+                    model: str = "unknown",
+                    input_tokens: int = 0,
+                    output_tokens: int = 0,
+                    cost_eur: float = 0.0,
+                    success: bool = True,
+                    error_type: str = None,
+        ):
+                    """Record a chat task for dashboard metrics."""
+                    self._ensure_initialized()
+                    total_tokens = input_tokens + output_tokens
+                    status = "success" if success else "failed"
+                    cost_usd = cost_eur / 0.92 if cost_eur else 0.0
+
+            if self._metrics:
+                            self._metrics["tasks_total"].add(1, {"task_type": "chat", "status": status})
+                            self._metrics["task_tokens"].record(total_tokens, {"task_type": "chat"})
+                            if cost_usd > 0:
+                                                self._metrics["task_cost"].record(cost_usd, {"task_type": "chat"})
+                                            self._metrics["provider_requests"].add(1, {"provider": "routellm", "model": model, "success": str(success).lower()})
+                            if not success and error_type:
+                                                self._metrics["tool_errors"].add(1, {"tool": "chat", "error_type": error_type})
+                                            savings = max(0, self._estimate_competitor_cost(total_tokens) - cost_usd)
+                            if savings > 0:
+                                                self._metrics["cost_savings"].add(savings)
+
+            if success:
+                            logger.info(f"Chat task: model={model}, tokens={total_tokens}, cost=EUR{cost_eur:.6f}")
+            else:
+                            logger.warning(f"Chat task failed: model={model}, error={error_type}")
+                
     def _estimate_competitor_cost(self, total_tokens: int) -> float:
         avg_rate = sum(COMPETITOR_COSTS.values()) / len(COMPETITOR_COSTS)
         return (total_tokens / 1000) * avg_rate
